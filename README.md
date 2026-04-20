@@ -5,7 +5,7 @@ PostgreSQL and MySQL/MariaDB driver for [Praia](https://github.com/praia-lang/pr
 ## Install
 
 ```bash
-sand install github.com/praia-lang/praia-sql
+sand install github.com/viggou/praia-db
 ```
 
 ## Usage
