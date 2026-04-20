@@ -1,0 +1,63 @@
+// PostgreSQL example
+//
+// Before running, ensure PostgreSQL is running and the user/database exist.
+// For MD5 auth, set pg_hba.conf:
+//   host all all 127.0.0.1/32 md5
+//
+// Then reload: pg_ctl reload
+
+use "db"
+
+let pg = db.postgres({
+    host: "localhost",
+    port: 5432,
+    user: "admin",
+    password: "secret",
+    database: "testdb"
+})
+
+print("Connected to PostgreSQL")
+
+// Create a table
+pg.run("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, name TEXT NOT NULL, age INT, email TEXT)")
+print("Table created")
+
+// Insert rows with parameterized queries (? placeholders)
+pg.run("INSERT INTO users (name, age, email) VALUES (?, ?, ?)", ["Ada", 36, "ada@example.com"])
+pg.run("INSERT INTO users (name, age, email) VALUES (?, ?, ?)", ["Bob", 28, "bob@example.com"])
+pg.run("INSERT INTO users (name, age, email) VALUES (?, ?, ?)", ["Charlie", 42, nil])
+
+let result = pg.run("INSERT INTO users (name, age, email) VALUES (?, ?, ?)", ["Diana", 31, "diana@example.com"])
+print("Inserted, rows affected:", result.changes)
+
+// Query rows
+let users = pg.query("SELECT * FROM users")
+print("\nAll users:")
+for (user in users) {
+    print("  %{user.name} (age %{user.age}) — %{user.email}")
+}
+
+// Parameterized query
+let adults = pg.query("SELECT name, age FROM users WHERE age > ?", [30])
+print("\nUsers over 30:")
+for (u in adults) {
+    print("  %{u.name}: %{u.age}")
+}
+
+// Update
+let updated = pg.run("UPDATE users SET age = ? WHERE name = ?", [29, "Bob"])
+print("\nUpdated %{updated.changes} row(s)")
+
+// Delete
+let deleted = pg.run("DELETE FROM users WHERE name = ?", ["Charlie"])
+print("Deleted %{deleted.changes} row(s)")
+
+// Aggregation
+let stats = pg.query("SELECT COUNT(*) as count, AVG(age) as avg_age FROM users")
+print("\nStats: %{stats[0].count} users, avg age %{stats[0].avg_age}")
+
+// Cleanup
+pg.run("DROP TABLE users")
+
+pg.close()
+print("\nDone.")

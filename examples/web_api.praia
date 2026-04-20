@@ -1,0 +1,60 @@
+// REST API backed by PostgreSQL
+//
+// Demonstrates using the db grain with Praia's router for a web API.
+
+use "router"
+use "db"
+
+let pg = db.postgres({
+    host: "localhost",
+    user: "admin",
+    password: "secret",
+    database: "myapp"
+})
+
+pg.run("CREATE TABLE IF NOT EXISTS todos (id SERIAL PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN DEFAULT FALSE)")
+
+let app = router.create()
+
+app.get("/todos", lam{ req, params in
+    let todos = pg.query("SELECT * FROM todos ORDER BY id")
+    return http.json(todos)
+})
+
+app.get("/todos/:id", lam{ req, params in
+    let rows = pg.query("SELECT * FROM todos WHERE id = ?", [num(params.id)])
+    if (len(rows) == 0) {
+        return http.json({error: "not found"}, 404)
+    }
+    return http.json(rows[0])
+})
+
+app.post("/todos", lam{ req, params in
+    let body = json.parse(req.body)
+    let rows = pg.query("INSERT INTO todos (title) VALUES (?) RETURNING *", [body.title])
+    return http.json(rows[0], 201)
+})
+
+app.put("/todos/:id", lam{ req, params in
+    let body = json.parse(req.body)
+    let result = pg.run("UPDATE todos SET done = ? WHERE id = ?", [body.done, num(params.id)])
+    if (result.changes == 0) {
+        return http.json({error: "not found"}, 404)
+    }
+    return http.json({ok: true})
+})
+
+app.delete("/todos/:id", lam{ req, params in
+    let result = pg.run("DELETE FROM todos WHERE id = ?", [num(params.id)])
+    if (result.changes == 0) {
+        return http.json({error: "not found"}, 404)
+    }
+    return http.json({ok: true})
+})
+
+print("Starting server on :8080")
+app.listen(8080)
+
+// Runs after Ctrl-C
+pg.close()
+print("Database connection closed")

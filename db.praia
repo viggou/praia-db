@@ -1,0 +1,1093 @@
+// grains/db.praia — Database grain for PostgreSQL and MySQL/MariaDB
+//
+// Implements the PostgreSQL v3 and MySQL wire protocols using raw TCP sockets.
+// Provides a unified API matching Praia's built-in SQLite interface.
+//
+// Usage:
+//   use "db"
+//   let pg = db.postgres({host: "localhost", user: "admin", password: "secret", database: "myapp"})
+//   let rows = pg.query("SELECT * FROM users WHERE age > ?", [18])
+//   let result = pg.run("INSERT INTO users (name, age) VALUES (?, ?)", ["Ada", 36])
+//   pg.close()
+//
+//   let my = db.mysql({host: "localhost", user: "root", password: "secret", database: "myapp"})
+//   let rows = my.query("SELECT * FROM users")
+//   my.close()
+
+// ============================================================
+// Helpers
+// ============================================================
+
+func hasKey(m, k) {
+    return keys(m).contains(k)
+}
+
+func substr(s, start, length) {
+    let result = ""
+    let end = start + length
+    if (end > len(s)) { end = len(s) }
+    for (i in start..end) {
+        result = result + s[i]
+    }
+    return result
+}
+
+func readByte(buf, offset) {
+    return buf[offset].charCode()
+}
+
+func readInt16BE(buf, offset) {
+    return (buf[offset].charCode() << 8) | buf[offset + 1].charCode()
+}
+
+func readInt32BE(buf, offset) {
+    return (buf[offset].charCode() << 24) | (buf[offset + 1].charCode() << 16) | (buf[offset + 2].charCode() << 8) | buf[offset + 3].charCode()
+}
+
+func readInt16LE(buf, offset) {
+    return buf[offset].charCode() | (buf[offset + 1].charCode() << 8)
+}
+
+func readInt32LE(buf, offset) {
+    return buf[offset].charCode() | (buf[offset + 1].charCode() << 8) | (buf[offset + 2].charCode() << 16) | (buf[offset + 3].charCode() << 24)
+}
+
+func writeInt32BE(n) {
+    return fromCharCode((n >> 24) & 255) + fromCharCode((n >> 16) & 255) + fromCharCode((n >> 8) & 255) + fromCharCode(n & 255)
+}
+
+func writeInt32LE(n) {
+    return fromCharCode(n & 255) + fromCharCode((n >> 8) & 255) + fromCharCode((n >> 16) & 255) + fromCharCode((n >> 24) & 255)
+}
+
+func writeInt16LE(n) {
+    return fromCharCode(n & 255) + fromCharCode((n >> 8) & 255)
+}
+
+func readCStr(buf, offset) {
+    let result = ""
+    let i = offset
+    while (i < len(buf) && buf[i].charCode() != 0) {
+        result = result + buf[i]
+        i = i + 1
+    }
+    return {value: result, next: i + 1}
+}
+
+func cstr(s) {
+    return s + fromCharCode(0)
+}
+
+func recvExact(sock, n) {
+    let result = ""
+    while (len(result) < n) {
+        let chunk = net.recv(sock, n - len(result))
+        if (len(chunk) == 0) {
+            throw "Connection closed unexpectedly"
+        }
+        result = result + chunk
+    }
+    return result
+}
+
+// ============================================================
+// SHA1 (needed for MySQL mysql_native_password authentication)
+// ============================================================
+
+func sha1Raw(message) {
+    let MASK = 4294967295
+
+    func rotl(x, n) {
+        return ((x << n) | (x >> (32 - n))) & MASK
+    }
+
+    let msgBytes = []
+    for (i in 0..len(message)) {
+        msgBytes.push(message[i].charCode())
+    }
+
+    let bitLen = len(msgBytes) * 8
+    msgBytes.push(128)
+    while ((len(msgBytes) % 64) != 56) {
+        msgBytes.push(0)
+    }
+    // 64-bit big-endian length (upper 32 bits are 0 for practical strings)
+    msgBytes.push(0)
+    msgBytes.push(0)
+    msgBytes.push(0)
+    msgBytes.push(0)
+    msgBytes.push((bitLen >> 24) & 255)
+    msgBytes.push((bitLen >> 16) & 255)
+    msgBytes.push((bitLen >> 8) & 255)
+    msgBytes.push(bitLen & 255)
+
+    let h0 = 1732584193
+    let h1 = 4023233417
+    let h2 = 2562383102
+    let h3 = 271733878
+    let h4 = 3285377520
+
+    let numBlocks = len(msgBytes) / 64
+    for (block in 0..numBlocks) {
+        let off = block * 64
+        let w = []
+        for (i in 0..16) {
+            let idx = off + i * 4
+            w.push(((msgBytes[idx] << 24) | (msgBytes[idx + 1] << 16) | (msgBytes[idx + 2] << 8) | msgBytes[idx + 3]) & MASK)
+        }
+        for (i in 16..80) {
+            w.push(rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1))
+        }
+
+        let a = h0
+        let b = h1
+        let c = h2
+        let d = h3
+        let e = h4
+
+        for (i in 0..80) {
+            let f = 0
+            let k = 0
+            if (i < 20) {
+                f = ((b & c) | ((~b & MASK) & d)) & MASK
+                k = 1518500249
+            } elif (i < 40) {
+                f = (b ^ c ^ d) & MASK
+                k = 1859775393
+            } elif (i < 60) {
+                f = ((b & c) | (b & d) | (c & d)) & MASK
+                k = 2400959708
+            } else {
+                f = (b ^ c ^ d) & MASK
+                k = 3395469782
+            }
+
+            let temp = (rotl(a, 5) + f + e + k + w[i]) & MASK
+            e = d
+            d = c
+            c = rotl(b, 30)
+            b = a
+            a = temp
+        }
+
+        h0 = (h0 + a) & MASK
+        h1 = (h1 + b) & MASK
+        h2 = (h2 + c) & MASK
+        h3 = (h3 + d) & MASK
+        h4 = (h4 + e) & MASK
+    }
+
+    let result = ""
+    let hvals = [h0, h1, h2, h3, h4]
+    for (h in hvals) {
+        result = result + fromCharCode((h >> 24) & 255)
+        result = result + fromCharCode((h >> 16) & 255)
+        result = result + fromCharCode((h >> 8) & 255)
+        result = result + fromCharCode(h & 255)
+    }
+    return result
+}
+
+func xorBytes(a, b) {
+    let result = ""
+    for (i in 0..len(a)) {
+        result = result + fromCharCode(a[i].charCode() ^ b[i].charCode())
+    }
+    return result
+}
+
+// ============================================================
+// HMAC-SHA-256, PBKDF2, and SCRAM helpers
+// ============================================================
+
+func hexVal(ch) {
+    let c = ch.charCode()
+    if (c >= 48 && c <= 57) { return c - 48 }
+    if (c >= 97 && c <= 102) { return c - 87 }
+    if (c >= 65 && c <= 70) { return c - 55 }
+    return 0
+}
+
+func hexToBytes(hex) {
+    let result = ""
+    let i = 0
+    while (i < len(hex)) {
+        result = result + fromCharCode(hexVal(hex[i]) * 16 + hexVal(hex[i + 1]))
+        i = i + 2
+    }
+    return result
+}
+
+func sha256Raw(data) {
+    return hexToBytes(crypto.sha256(data))
+}
+
+func hmacSha256(key, message) {
+    if (len(key) > 64) {
+        key = sha256Raw(key)
+    }
+    while (len(key) < 64) {
+        key = key + fromCharCode(0)
+    }
+    let ipad = ""
+    let opad = ""
+    for (i in 0..64) {
+        ipad = ipad + fromCharCode(key[i].charCode() ^ 54)
+        opad = opad + fromCharCode(key[i].charCode() ^ 92)
+    }
+    return sha256Raw(opad + sha256Raw(ipad + message))
+}
+
+func pbkdf2Sha256(password, salt, iterations) {
+    // Pre-compute HMAC key pads for the fixed password
+    let key = password
+    if (len(key) > 64) { key = sha256Raw(key) }
+    while (len(key) < 64) { key = key + fromCharCode(0) }
+    let ipad = ""
+    let opad = ""
+    for (i in 0..64) {
+        ipad = ipad + fromCharCode(key[i].charCode() ^ 54)
+        opad = opad + fromCharCode(key[i].charCode() ^ 92)
+    }
+    func hmac(msg) {
+        return sha256Raw(opad + sha256Raw(ipad + msg))
+    }
+
+    let u = hmac(salt + writeInt32BE(1))
+    let result = u
+    for (i in 1..iterations) {
+        u = hmac(u)
+        result = xorBytes(result, u)
+    }
+    return result
+}
+
+func generateNonce() {
+    let chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    let nonce = ""
+    for (i in 0..24) {
+        nonce = nonce + chars[random.int(0, len(chars) - 1)]
+    }
+    return nonce
+}
+
+func scramUsername(name) {
+    return name.replace("=", "=3D").replace(",", "=2C")
+}
+
+func parseScramAttrs(msg) {
+    let result = {}
+    let parts = msg.split(",")
+    for (part in parts) {
+        if (len(part) >= 2) {
+            let key = part[0]
+            let value = substr(part, 2, len(part) - 2)
+            result[key] = value
+        }
+    }
+    return result
+}
+
+// ============================================================
+// Parameter escaping and interpolation
+// ============================================================
+
+func escapePostgres(value) {
+    if (value == nil) { return "NULL" }
+    let t = type(value)
+    if (t == "number") { return str(value) }
+    if (t == "bool") {
+        if (value) { return "TRUE" }
+        return "FALSE"
+    }
+    let escaped = str(value).replace("'", "''")
+    return "'" + escaped + "'"
+}
+
+func escapeMysql(value) {
+    if (value == nil) { return "NULL" }
+    let t = type(value)
+    if (t == "number") { return str(value) }
+    if (t == "bool") {
+        if (value) { return "1" }
+        return "0"
+    }
+    let escaped = str(value).replace("\\", "\\\\").replace("'", "\\'")
+    return "'" + escaped + "'"
+}
+
+func interpolateParams(sql, params, escapeFn) {
+    if (params == nil || len(params) == 0) { return sql }
+    let result = ""
+    let paramIdx = 0
+    let inString = false
+    let i = 0
+    let sqlLen = len(sql)
+    while (i < sqlLen) {
+        let ch = sql[i]
+        if (inString) {
+            result = result + ch
+            if (ch == "'") {
+                if (i + 1 < sqlLen && sql[i + 1] == "'") {
+                    result = result + "'"
+                    i = i + 2
+                    continue
+                }
+                inString = false
+            }
+        } else {
+            if (ch == "'") {
+                inString = true
+                result = result + ch
+            } elif (ch == "?" && paramIdx < len(params)) {
+                result = result + escapeFn(params[paramIdx])
+                paramIdx = paramIdx + 1
+            } else {
+                result = result + ch
+            }
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// ============================================================
+// PostgreSQL wire protocol
+// ============================================================
+
+func readPgMessage(sock) {
+    let typeByte = recvExact(sock, 1)
+    let lenBytes = recvExact(sock, 4)
+    let msgLen = readInt32BE(lenBytes, 0)
+    let data = ""
+    if (msgLen > 4) {
+        data = recvExact(sock, msgLen - 4)
+    }
+    return {type: typeByte, data: data}
+}
+
+func buildPgMessage(msgType, payload) {
+    let msgLen = 4 + len(payload)
+    return msgType + writeInt32BE(msgLen) + payload
+}
+
+func parsePgError(data) {
+    let msg = ""
+    let i = 0
+    while (i < len(data)) {
+        let fieldType = data[i]
+        if (fieldType.charCode() == 0) { break }
+        i = i + 1
+        let r = readCStr(data, i)
+        if (fieldType == "M") {
+            msg = r.value
+        }
+        i = r.next
+    }
+    if (len(msg) == 0) { msg = "unknown error" }
+    return msg
+}
+
+func parsePgRowDescription(data) {
+    let numFields = readInt16BE(data, 0)
+    let offset = 2
+    let columns = []
+
+    for (i in 0..numFields) {
+        let nameResult = readCStr(data, offset)
+        offset = nameResult.next
+        // tableOID(4) + columnNum(2) = 6 bytes
+        offset = offset + 6
+        let typeOid = readInt32BE(data, offset)
+        offset = offset + 4
+        // typeSize(2) + typeMod(4) + formatCode(2) = 8 bytes
+        offset = offset + 8
+        columns.push({name: nameResult.value, typeOid: typeOid})
+    }
+    return columns
+}
+
+func convertPgValue(value, typeOid) {
+    if (value == nil) { return nil }
+    // bool (16)
+    if (typeOid == 16) { return value == "t" }
+    // int2(21), int4(23), int8(20), oid(26)
+    if (typeOid == 20 || typeOid == 21 || typeOid == 23 || typeOid == 26) {
+        return num(value)
+    }
+    // float4(700), float8(701), numeric(1700)
+    if (typeOid == 700 || typeOid == 701 || typeOid == 1700) {
+        return num(value)
+    }
+    return value
+}
+
+func parsePgDataRow(data, columns) {
+    let numCols = readInt16BE(data, 0)
+    let offset = 2
+    let row = {}
+
+    for (i in 0..numCols) {
+        let colLen = readInt32BE(data, offset)
+        offset = offset + 4
+
+        if (colLen == 4294967295) {
+            // -1 as unsigned 32-bit = NULL
+            row[columns[i].name] = nil
+        } else {
+            let value = substr(data, offset, colLen)
+            offset = offset + colLen
+            row[columns[i].name] = convertPgValue(value, columns[i].typeOid)
+        }
+    }
+    return row
+}
+
+func parseCommandTag(tag) {
+    let parts = tag.split(" ")
+    let n = len(parts)
+    if (n == 0) { return {changes: 0, lastId: 0} }
+    let command = parts[0]
+    if (command == "INSERT" && n >= 3) {
+        return {changes: num(parts[2]), lastId: 0}
+    }
+    if ((command == "UPDATE" || command == "DELETE" || command == "SELECT") && n >= 2) {
+        return {changes: num(parts[1]), lastId: 0}
+    }
+    return {changes: 0, lastId: 0}
+}
+
+// Connect to PostgreSQL and return a client object.
+//
+// Config:
+//   host     — default "localhost"
+//   port     — default 5432
+//   user     — required
+//   password — default ""
+//   database — default same as user
+//
+// Supported auth: trust, cleartext password, MD5, SCRAM-SHA-256.
+func postgres(config) {
+    ensure (hasKey(config, "user")) else {
+        throw "PostgreSQL: 'user' is required in config"
+    }
+
+    let host = "localhost"
+    if (hasKey(config, "host")) { host = config.host }
+    let port = 5432
+    if (hasKey(config, "port")) { port = config.port }
+    let user = config.user
+    let password = ""
+    if (hasKey(config, "password")) { password = config.password }
+    let database = user
+    if (hasKey(config, "database")) { database = config.database }
+
+    let sock = net.connect(host, port)
+
+    // Startup message: length(4) + protocol version 3.0(4) + params + \0
+    let params = cstr("user") + cstr(user) + cstr("database") + cstr(database) + fromCharCode(0)
+    let body = writeInt32BE(196608) + params
+    net.send(sock, writeInt32BE(4 + len(body)) + body)
+
+    // Authentication
+    let authMsg = readPgMessage(sock)
+    if (authMsg.type != "R") {
+        net.close(sock)
+        throw "PostgreSQL: unexpected message during auth: " + authMsg.type
+    }
+
+    let authType = readInt32BE(authMsg.data, 0)
+
+    if (authType == 0) {
+        // Trust — no password needed
+    } elif (authType == 3) {
+        // Cleartext password
+        net.send(sock, buildPgMessage("p", cstr(password)))
+        let resp = readPgMessage(sock)
+        if (resp.type == "E") {
+            let err = parsePgError(resp.data)
+            net.close(sock)
+            throw "PostgreSQL auth failed: " + err
+        }
+    } elif (authType == 5) {
+        // MD5 password: "md5" + md5(md5(password + user) + salt)
+        let salt = substr(authMsg.data, 4, 4)
+        let md5pass = "md5" + crypto.md5(crypto.md5(password + user) + salt)
+        net.send(sock, buildPgMessage("p", cstr(md5pass)))
+        let resp = readPgMessage(sock)
+        if (resp.type == "E") {
+            let err = parsePgError(resp.data)
+            net.close(sock)
+            throw "PostgreSQL auth failed: " + err
+        }
+    } elif (authType == 10) {
+        // SASL authentication — parse mechanism list
+        let mechOffset = 4
+        let mechanisms = []
+        while (mechOffset < len(authMsg.data)) {
+            let mr = readCStr(authMsg.data, mechOffset)
+            if (len(mr.value) == 0) { break }
+            mechanisms.push(mr.value)
+            mechOffset = mr.next
+        }
+
+        if (!mechanisms.contains("SCRAM-SHA-256")) {
+            net.close(sock)
+            throw "PostgreSQL: server offered SASL mechanisms [" + mechanisms.join(", ") + "] but only SCRAM-SHA-256 is supported"
+        }
+
+        // --- SCRAM-SHA-256 exchange ---
+        let clientNonce = generateNonce()
+        let clientFirstBare = "n=" + scramUsername(user) + ",r=" + clientNonce
+        let clientFirst = "n,," + clientFirstBare
+
+        // Send SASLInitialResponse
+        let saslPayload = cstr("SCRAM-SHA-256") + writeInt32BE(len(clientFirst)) + clientFirst
+        net.send(sock, buildPgMessage("p", saslPayload))
+
+        // Read AuthenticationSASLContinue (authType 11)
+        let contMsg = readPgMessage(sock)
+        if (contMsg.type == "E") {
+            let err = parsePgError(contMsg.data)
+            net.close(sock)
+            throw "PostgreSQL SCRAM auth failed: " + err
+        }
+        let contAuthType = readInt32BE(contMsg.data, 0)
+        if (contAuthType != 11) {
+            net.close(sock)
+            throw "PostgreSQL: expected SASLContinue (11), got " + str(contAuthType)
+        }
+        let serverFirst = substr(contMsg.data, 4, len(contMsg.data) - 4)
+
+        // Parse server-first-message: r=...,s=...,i=...
+        let sf = parseScramAttrs(serverFirst)
+        let serverNonce = sf["r"]
+        let saltB64 = sf["s"]
+        let iterations = num(sf["i"])
+
+        // Verify server nonce starts with our client nonce
+        if (!serverNonce.startsWith(clientNonce)) {
+            net.close(sock)
+            throw "PostgreSQL: SCRAM server nonce does not start with client nonce"
+        }
+
+        // Compute proof
+        let saltBytes = base64.decode(saltB64)
+        let saltedPassword = pbkdf2Sha256(password, saltBytes, iterations)
+        let clientKey = hmacSha256(saltedPassword, "Client Key")
+        let storedKey = sha256Raw(clientKey)
+        let clientFinalWithoutProof = "c=biws,r=" + serverNonce
+        let authMessage = clientFirstBare + "," + serverFirst + "," + clientFinalWithoutProof
+        let clientSignature = hmacSha256(storedKey, authMessage)
+        let clientProof = xorBytes(clientKey, clientSignature)
+        let clientFinal = clientFinalWithoutProof + ",p=" + base64.encode(clientProof)
+
+        // Send SASLResponse
+        net.send(sock, buildPgMessage("p", clientFinal))
+
+        // Read AuthenticationSASLFinal (authType 12)
+        let finalMsg = readPgMessage(sock)
+        if (finalMsg.type == "E") {
+            let err = parsePgError(finalMsg.data)
+            net.close(sock)
+            throw "PostgreSQL SCRAM auth failed: " + err
+        }
+        let finalAuthType = readInt32BE(finalMsg.data, 0)
+        if (finalAuthType != 12) {
+            net.close(sock)
+            throw "PostgreSQL: expected SASLFinal (12), got " + str(finalAuthType)
+        }
+
+        // Verify server signature
+        let serverFinal = substr(finalMsg.data, 4, len(finalMsg.data) - 4)
+        let sfAttrs = parseScramAttrs(serverFinal)
+        let serverSig = base64.decode(sfAttrs["v"])
+        let serverKey = hmacSha256(saltedPassword, "Server Key")
+        let expectedSig = hmacSha256(serverKey, authMessage)
+        if (serverSig != expectedSig) {
+            net.close(sock)
+            throw "PostgreSQL: SCRAM server signature verification failed"
+        }
+
+        // Read AuthenticationOk
+        let okMsg = readPgMessage(sock)
+        if (okMsg.type == "E") {
+            let err = parsePgError(okMsg.data)
+            net.close(sock)
+            throw "PostgreSQL SCRAM auth failed: " + err
+        }
+    } else {
+        net.close(sock)
+        throw "PostgreSQL: unsupported auth method (type " + str(authType) + ")"
+    }
+
+    // Read until ReadyForQuery ('Z')
+    while (true) {
+        let msg = readPgMessage(sock)
+        if (msg.type == "Z") { break }
+        if (msg.type == "E") {
+            let err = parsePgError(msg.data)
+            net.close(sock)
+            throw "PostgreSQL startup error: " + err
+        }
+    }
+
+    // -- Connection established --
+    let closed = false
+
+    func execPg(sql) {
+        if (closed) { throw "PostgreSQL: connection is closed" }
+        net.send(sock, buildPgMessage("Q", cstr(sql)))
+
+        let columns = []
+        let rows = []
+        let commandTag = ""
+
+        while (true) {
+            let msg = readPgMessage(sock)
+
+            if (msg.type == "T") {
+                columns = parsePgRowDescription(msg.data)
+            } elif (msg.type == "D") {
+                rows.push(parsePgDataRow(msg.data, columns))
+            } elif (msg.type == "C") {
+                commandTag = readCStr(msg.data, 0).value
+            } elif (msg.type == "Z") {
+                break
+            } elif (msg.type == "E") {
+                let errMsg = parsePgError(msg.data)
+                // Drain until ReadyForQuery so the connection stays usable
+                while (true) {
+                    let m = readPgMessage(sock)
+                    if (m.type == "Z") { break }
+                }
+                throw "PostgreSQL: " + errMsg
+            }
+            // Skip notices ('N'), parameter status ('S'), etc.
+        }
+
+        return {rows: rows, commandTag: commandTag}
+    }
+
+    return {
+        query: lam{ sql, params in
+            let finalSql = interpolateParams(sql, params, escapePostgres)
+            return execPg(finalSql).rows
+        },
+
+        run: lam{ sql, params in
+            let finalSql = interpolateParams(sql, params, escapePostgres)
+            return parseCommandTag(execPg(finalSql).commandTag)
+        },
+
+        close: lam{ in
+            if (!closed) {
+                try {
+                    net.send(sock, buildPgMessage("X", ""))
+                } catch (e) {}
+                net.close(sock)
+                closed = true
+            }
+        }
+    }
+}
+
+// ============================================================
+// MySQL / MariaDB wire protocol
+// ============================================================
+
+func readMysqlPacket(sock) {
+    let header = recvExact(sock, 4)
+    let payloadLen = header[0].charCode() | (header[1].charCode() << 8) | (header[2].charCode() << 16)
+    let seq = header[3].charCode()
+    let data = ""
+    if (payloadLen > 0) {
+        data = recvExact(sock, payloadLen)
+    }
+    return {length: payloadLen, seq: seq, data: data}
+}
+
+func sendMysqlPacket(sock, seq, data) {
+    let pLen = len(data)
+    let header = fromCharCode(pLen & 255) + fromCharCode((pLen >> 8) & 255) + fromCharCode((pLen >> 16) & 255) + fromCharCode(seq & 255)
+    net.send(sock, header + data)
+}
+
+func readLenEncInt(data, offset) {
+    let first = data[offset].charCode()
+    if (first < 251) {
+        return {value: first, next: offset + 1}
+    }
+    if (first == 252) {
+        return {value: readInt16LE(data, offset + 1), next: offset + 3}
+    }
+    if (first == 253) {
+        let v = data[offset + 1].charCode() | (data[offset + 2].charCode() << 8) | (data[offset + 3].charCode() << 16)
+        return {value: v, next: offset + 4}
+    }
+    if (first == 254) {
+        return {value: readInt32LE(data, offset + 1), next: offset + 9}
+    }
+    return {value: 0, next: offset + 1}
+}
+
+func readLenEncStr(data, offset) {
+    let r = readLenEncInt(data, offset)
+    let value = substr(data, r.next, r.value)
+    return {value: value, next: r.next + r.value}
+}
+
+func parseMysqlGreeting(data) {
+    let offset = 0
+    let protocolVersion = data[offset].charCode()
+    offset = offset + 1
+
+    let vr = readCStr(data, offset)
+    let serverVersion = vr.value
+    offset = vr.next
+
+    let connId = readInt32LE(data, offset)
+    offset = offset + 4
+
+    // Scramble part 1 (8 bytes)
+    let scramble1 = substr(data, offset, 8)
+    offset = offset + 8
+
+    offset = offset + 1  // filler 0x00
+
+    let capLower = readInt16LE(data, offset)
+    offset = offset + 2
+
+    let charset = data[offset].charCode()
+    offset = offset + 1
+
+    let statusFlags = readInt16LE(data, offset)
+    offset = offset + 2
+
+    let capUpper = readInt16LE(data, offset)
+    offset = offset + 2
+
+    let authPluginDataLen = data[offset].charCode()
+    offset = offset + 1
+
+    offset = offset + 10  // reserved
+
+    // Scramble part 2
+    let scramble2Len = 13
+    if (authPluginDataLen > 8) {
+        let computed = authPluginDataLen - 8
+        if (computed > scramble2Len) { scramble2Len = computed }
+    }
+    let scramble2DataLen = scramble2Len - 1
+    if (scramble2DataLen < 0) { scramble2DataLen = 0 }
+    let scramble2 = substr(data, offset, scramble2DataLen)
+    offset = offset + scramble2Len
+
+    let authPlugin = ""
+    if (offset < len(data)) {
+        authPlugin = readCStr(data, offset).value
+    }
+
+    return {
+        serverVersion: serverVersion,
+        connectionId: connId,
+        scramble: scramble1 + scramble2,
+        capabilities: capLower | (capUpper << 16),
+        charset: charset,
+        authPlugin: authPlugin
+    }
+}
+
+func parseMysqlError(data) {
+    // 0xFF(1) + error_code(2) + '#'(1) + sql_state(5) + message
+    let errCode = readInt16LE(data, 1)
+    let msg = ""
+    if (len(data) > 3 && data[3] == "#") {
+        msg = substr(data, 9, len(data) - 9)
+    } else {
+        msg = substr(data, 3, len(data) - 3)
+    }
+    return str(errCode) + ": " + msg
+}
+
+func parseMysqlOk(data) {
+    // 0x00(1) + affected_rows(lenenc) + last_insert_id(lenenc) + ...
+    let r1 = readLenEncInt(data, 1)
+    let affectedRows = r1.value
+    let r2 = readLenEncInt(data, r1.next)
+    let lastInsertId = r2.value
+    return {affectedRows: affectedRows, lastInsertId: lastInsertId}
+}
+
+func parseMysqlColumnDef(data) {
+    let offset = 0
+    // Skip: catalog, schema, table, org_table
+    let r = readLenEncStr(data, offset)
+    offset = r.next
+    r = readLenEncStr(data, offset)
+    offset = r.next
+    r = readLenEncStr(data, offset)
+    offset = r.next
+    r = readLenEncStr(data, offset)
+    offset = r.next
+
+    // Column name
+    r = readLenEncStr(data, offset)
+    let name = r.value
+    offset = r.next
+
+    // Skip org_name
+    r = readLenEncStr(data, offset)
+    offset = r.next
+
+    // Skip fixed-length fields marker (lenenc, should be 0x0c)
+    let fix = readLenEncInt(data, offset)
+    offset = fix.next
+
+    // charset(2) + column_length(4) = 6 bytes
+    offset = offset + 6
+
+    let colType = data[offset].charCode()
+
+    return {name: name, colType: colType}
+}
+
+func convertMysqlValue(value, colType) {
+    if (value == nil) { return nil }
+    // TINY(1), SHORT(2), LONG(3), LONGLONG(8), INT24(9)
+    if (colType == 1 || colType == 2 || colType == 3 || colType == 8 || colType == 9) {
+        return num(value)
+    }
+    // FLOAT(4), DOUBLE(5), NEWDECIMAL(246)
+    if (colType == 4 || colType == 5 || colType == 246) {
+        return num(value)
+    }
+    return value
+}
+
+func mysqlNativeAuth(password, scramble) {
+    if (len(password) == 0) { return "" }
+    let stage1 = sha1Raw(password)
+    let stage2 = sha1Raw(stage1)
+    let stage3 = sha1Raw(scramble + stage2)
+    return xorBytes(stage1, stage3)
+}
+
+// Connect to MySQL/MariaDB and return a client object.
+//
+// Config:
+//   host     — default "localhost"
+//   port     — default 3306
+//   user     — required
+//   password — default ""
+//   database — optional
+//
+// Supported auth: mysql_native_password (MariaDB default, MySQL 5.x default).
+// For MySQL 8+ (caching_sha2_password default), create the user with:
+//   CREATE USER 'user'@'%' IDENTIFIED WITH mysql_native_password BY 'password';
+func mysql(config) {
+    ensure (hasKey(config, "user")) else {
+        throw "MySQL: 'user' is required in config"
+    }
+
+    let host = "localhost"
+    if (hasKey(config, "host")) { host = config.host }
+    let port = 3306
+    if (hasKey(config, "port")) { port = config.port }
+    let user = config.user
+    let password = ""
+    if (hasKey(config, "password")) { password = config.password }
+    let database = ""
+    if (hasKey(config, "database")) { database = config.database }
+
+    let sock = net.connect(host, port)
+
+    // Read server greeting
+    let greetPkt = readMysqlPacket(sock)
+    if (greetPkt.data[0].charCode() == 255) {
+        let err = parseMysqlError(greetPkt.data)
+        net.close(sock)
+        throw "MySQL connection refused: " + err
+    }
+    let greeting = parseMysqlGreeting(greetPkt.data)
+
+    // Capability flags
+    let CLIENT_LONG_PASSWORD = 1
+    let CLIENT_LONG_FLAG = 4
+    let CLIENT_CONNECT_WITH_DB = 8
+    let CLIENT_PROTOCOL_41 = 512
+    let CLIENT_TRANSACTIONS = 8192
+    let CLIENT_SECURE_CONNECTION = 32768
+    let CLIENT_PLUGIN_AUTH = 524288
+
+    let caps = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH | CLIENT_LONG_PASSWORD | CLIENT_LONG_FLAG | CLIENT_TRANSACTIONS
+    if (len(database) > 0) {
+        caps = caps | CLIENT_CONNECT_WITH_DB
+    }
+    caps = caps & greeting.capabilities
+
+    // Compute auth response
+    let authPlugin = greeting.authPlugin
+    let authData = ""
+
+    if (authPlugin == "mysql_native_password") {
+        authData = mysqlNativeAuth(password, greeting.scramble)
+    } elif (authPlugin == "caching_sha2_password") {
+        net.close(sock)
+        throw "MySQL: caching_sha2_password is not supported. Create the user with mysql_native_password:\n  CREATE USER 'user'@'%' IDENTIFIED WITH mysql_native_password BY 'password';"
+    } else {
+        // Try mysql_native_password as fallback
+        authData = mysqlNativeAuth(password, greeting.scramble)
+        authPlugin = "mysql_native_password"
+    }
+
+    // Build handshake response
+    let response = writeInt32LE(caps)
+    response = response + writeInt32LE(16777216)     // max packet size 16MB
+    response = response + fromCharCode(45)           // charset utf8mb4
+    for (i in 0..23) { response = response + fromCharCode(0) }  // reserved
+    response = response + cstr(user)
+    response = response + fromCharCode(len(authData)) + authData
+    if (len(database) > 0 && (caps & CLIENT_CONNECT_WITH_DB) != 0) {
+        response = response + cstr(database)
+    }
+    if ((caps & CLIENT_PLUGIN_AUTH) != 0) {
+        response = response + cstr(authPlugin)
+    }
+
+    sendMysqlPacket(sock, 1, response)
+
+    // Read auth result
+    let authResult = readMysqlPacket(sock)
+    let fb = authResult.data[0].charCode()
+
+    if (fb == 255) {
+        let err = parseMysqlError(authResult.data)
+        net.close(sock)
+        throw "MySQL auth failed: " + err
+    }
+
+    if (fb == 254) {
+        // Auth switch request
+        let pluginR = readCStr(authResult.data, 1)
+        let switchPlugin = pluginR.value
+
+        if (switchPlugin == "mysql_native_password") {
+            let newScramble = substr(authResult.data, pluginR.next, 20)
+            let newAuth = mysqlNativeAuth(password, newScramble)
+            sendMysqlPacket(sock, authResult.seq + 1, newAuth)
+            let switchResp = readMysqlPacket(sock)
+            if (switchResp.data[0].charCode() == 255) {
+                let err = parseMysqlError(switchResp.data)
+                net.close(sock)
+                throw "MySQL auth failed after switch: " + err
+            }
+        } else {
+            net.close(sock)
+            throw "MySQL: unsupported auth plugin switch to '" + switchPlugin + "'"
+        }
+    }
+
+    // fb == 0 means OK, connection established
+    let closed = false
+
+    func execMysql(sql) {
+        if (closed) { throw "MySQL: connection is closed" }
+
+        // COM_QUERY (0x03)
+        sendMysqlPacket(sock, 0, fromCharCode(3) + sql)
+
+        let firstPkt = readMysqlPacket(sock)
+        let firstByte = firstPkt.data[0].charCode()
+
+        if (firstByte == 255) {
+            throw "MySQL: " + parseMysqlError(firstPkt.data)
+        }
+
+        if (firstByte == 0) {
+            // OK packet — INSERT/UPDATE/DELETE result
+            let ok = parseMysqlOk(firstPkt.data)
+            return {isOk: true, affectedRows: ok.affectedRows, lastInsertId: ok.lastInsertId}
+        }
+
+        // Result set — first byte is column count
+        let colCountR = readLenEncInt(firstPkt.data, 0)
+        let numCols = colCountR.value
+
+        // Read column definitions
+        let columns = []
+        for (i in 0..numCols) {
+            let colPkt = readMysqlPacket(sock)
+            columns.push(parseMysqlColumnDef(colPkt.data))
+        }
+
+        // EOF after columns
+        let eofPkt = readMysqlPacket(sock)
+
+        // Read rows until EOF
+        let rows = []
+        while (true) {
+            let rowPkt = readMysqlPacket(sock)
+            let rowFb = rowPkt.data[0].charCode()
+
+            if (rowFb == 254 && rowPkt.length < 9) {
+                break  // EOF
+            }
+            if (rowFb == 255) {
+                throw "MySQL: " + parseMysqlError(rowPkt.data)
+            }
+
+            // Parse text-protocol row
+            let row = {}
+            let offset = 0
+            for (col in columns) {
+                let b = rowPkt.data[offset].charCode()
+                if (b == 251) {
+                    // NULL
+                    row[col.name] = nil
+                    offset = offset + 1
+                } else {
+                    let r = readLenEncStr(rowPkt.data, offset)
+                    row[col.name] = convertMysqlValue(r.value, col.colType)
+                    offset = r.next
+                }
+            }
+            rows.push(row)
+        }
+
+        return {isOk: false, rows: rows}
+    }
+
+    return {
+        query: lam{ sql, params in
+            let finalSql = interpolateParams(sql, params, escapeMysql)
+            let result = execMysql(finalSql)
+            if (hasKey(result, "rows")) {
+                return result.rows
+            }
+            return []
+        },
+
+        run: lam{ sql, params in
+            let finalSql = interpolateParams(sql, params, escapeMysql)
+            let result = execMysql(finalSql)
+            if (result.isOk) {
+                return {changes: result.affectedRows, lastId: result.lastInsertId}
+            }
+            return {changes: 0, lastId: 0}
+        },
+
+        close: lam{ in
+            if (!closed) {
+                try {
+                    // COM_QUIT (0x01)
+                    sendMysqlPacket(sock, 0, fromCharCode(1))
+                } catch (e) {}
+                net.close(sock)
+                closed = true
+            }
+        }
+    }
+}
+
+export { postgres, mysql }
