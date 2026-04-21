@@ -295,7 +295,7 @@ func parseScramAttrs(msg) {
 func escapePostgres(value) {
     if (value == nil) { return "NULL" }
     let t = type(value)
-    if (t == "number") { return str(value) }
+    if (t == "int" || t == "float") { return str(value) }
     if (t == "bool") {
         if (value) { return "TRUE" }
         return "FALSE"
@@ -307,7 +307,7 @@ func escapePostgres(value) {
 func escapeMysql(value) {
     if (value == nil) { return "NULL" }
     let t = type(value)
-    if (t == "number") { return str(value) }
+    if (t == "int" || t == "float") { return str(value) }
     if (t == "bool") {
         if (value) { return "1" }
         return "0"
