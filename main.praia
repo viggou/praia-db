@@ -561,6 +561,10 @@ func postgres(config) {
 
         // Parse server-first-message: r=...,s=...,i=...
         let sf = parseScramAttrs(serverFirst)
+        ensure (sf["r"] && sf["s"] && sf["i"]) else {
+            net.close(sock)
+            throw "SCRAM auth failed: malformed server response"
+        }
         let serverNonce = sf["r"]
         let saltB64 = sf["s"]
         let iterations = num(sf["i"])
