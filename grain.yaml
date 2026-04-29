@@ -1,5 +1,5 @@
 name: db
-version: 0.1.0
+version: 1.0.0
 description: PostgreSQL and MySQL/MariaDB driver for Praia using raw TCP sockets
 author: Viggo Lekdorf
 license: MIT
